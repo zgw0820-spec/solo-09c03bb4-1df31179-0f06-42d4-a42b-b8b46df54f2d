@@ -18,6 +18,26 @@ Runs against two live API instances and a real PostgreSQL and verifies:
       tracked state consistent with the actual index
   P6  the device/time-range query plan uses the new index
 
+Reliable-write path (request_id idempotency + outage staging):
+
+  R0  reliable write with db up -> persisted; visible via the original query
+      API; replay after 'lost receipt' deduplicates; different content -> 409
+  R1  concurrent identical submissions across both instances insert exactly
+      one row; concurrent different content for one request_id -> one winner,
+      the rest 409
+  R2  db outage: writes are 202-accepted only after durable staging,
+      occurred_at is fixed at acceptance; re-submits while down are
+      idempotent; after recovery the backfill inserts them (readable through
+      the original GET /logs) with the acceptance-time occurred_at
+  R3  staged records survive a hard restart of both instances and are
+      backfilled after recovery
+  R4  db row present + leftover staged copy: status says persisted (never
+      pending), backfill removes the copy without duplicating the row
+  R5  staged copy contradicting the db row is quarantined (.conflict), never
+      overwritten, surfaced by the status APIs
+  R6  db down AND staging unwritable -> 503 (local mode only)
+  R7  client-supplied occurred_at survives the staging/backfill round trip
+
 Modes:
   local   spawns/kills two local uvicorn processes (used in this sandbox)
   docker  drives `docker compose` services api1/api2
@@ -28,8 +48,10 @@ Requires psycopg (project venv). Usage:
 """
 
 import argparse
+import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +59,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import psycopg
 
@@ -45,6 +68,7 @@ INDEX_NAME = "idx_fault_logs_device_occurred"
 MARKER = "test-" + uuid.uuid4().hex[:10]
 
 RESULTS = []
+app_reliable = None  # imported in main() once --workdir is known
 
 
 def check(name, ok, detail=""):
@@ -149,8 +173,9 @@ def wait_state(bases, want, timeout=240):
 # ---------------------------------------------------------------------------
 
 class LocalInstance:
-    def __init__(self, name, port, dsn, workdir, logdir):
+    def __init__(self, name, port, dsn, workdir, logdir, staging_dir):
         self.name, self.port, self.dsn, self.workdir = name, port, dsn, workdir
+        self.staging_dir = staging_dir
         self.logpath = os.path.join(logdir, f"{name}.log")
         self.proc = None
 
@@ -158,6 +183,8 @@ class LocalInstance:
         env = dict(os.environ)
         env["DATABASE_URL"] = self.dsn
         env["ORPHAN_GRACE_SECONDS"] = str(GRACE)
+        env["STAGING_DIR"] = self.staging_dir
+        env["BACKFILL_INTERVAL_SECONDS"] = "1"
         self._log = open(self.logpath, "ab", buffering=0)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app",
@@ -185,6 +212,108 @@ class DockerInstance:
 
     def kill(self):
         self._compose("kill", self.service)
+
+
+# ---------------------------------------------------------------------------
+# Outage simulation + staging-dir access
+# ---------------------------------------------------------------------------
+
+def freeze_db(ctx):
+    """Simulate a PostgreSQL outage (connections hang/refused until thaw)."""
+    if ctx["mode"] == "docker":
+        subprocess.run(["docker", "compose", "stop", "db"],
+                       cwd=ctx["workdir"], check=True)
+    else:
+        # Stop postmaster AND backends (all have comm 'postgres').
+        subprocess.run(["pkill", "-STOP", "-x", "postgres"], check=True)
+    info("database frozen (outage simulated)")
+
+
+def unfreeze_db(ctx):
+    if ctx["mode"] == "docker":
+        subprocess.run(["docker", "compose", "start", "db"],
+                       cwd=ctx["workdir"], check=True)
+    else:
+        subprocess.run(["pkill", "-CONT", "-x", "postgres"], check=True)
+    info("database restored")
+
+
+def staging_names(ctx):
+    """File names currently in the shared staging directory."""
+    if ctx["mode"] == "docker":
+        out = subprocess.run(
+            ["docker", "compose", "exec", "-T", "api1", "ls", "-1", "/staging"],
+            cwd=ctx["workdir"], capture_output=True, text=True)
+        return out.stdout.split()
+    try:
+        return os.listdir(ctx["staging_dir"])
+    except FileNotFoundError:
+        return []
+
+
+def write_staged_file(ctx, rec):
+    """Plant a staged record exactly as the app would (crash-leftover
+    simulation), bypassing the API."""
+    data = app_reliable._staged_file_bytes(rec)
+    name = rec["request_id"] + ".json"
+    if ctx["mode"] == "docker":
+        tmp = os.path.join(ctx["logdir"], name)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        subprocess.run(["docker", "compose", "cp", tmp, f"api1:/staging/{name}"],
+                       cwd=ctx["workdir"], check=True)
+        return
+    path = os.path.join(ctx["staging_dir"], name)
+    with open(path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def wait_staging_gone(ctx, prefix, timeout=40):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(n.startswith(prefix) for n in staging_names(ctx)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_staging_present(ctx, marker, timeout=40):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if any(marker in n for n in staging_names(ctx)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_reliable_state(bases, rid, want, timeout=90):
+    """Poll GET /logs/reliable/<rid> (round-robin) until state == want."""
+    deadline = time.time() + timeout
+    i, last = 0, None
+    while time.time() < deadline:
+        code, st = http("GET", bases[i % len(bases)],
+                        f"/logs/reliable/{rid}", timeout=30)
+        i += 1
+        if code == 200:
+            last = st.get("state")
+            if last == want:
+                return st
+        time.sleep(0.5)
+    raise SystemExit(f"aborting: {rid} never became {want!r} (last={last!r})")
+
+
+def reset_staging(ctx):
+    """Start each run with an empty shared staging directory."""
+    if ctx["mode"] == "docker":
+        for svc in ("api1",):
+            subprocess.run(["docker", "compose", "exec", "-T", svc,
+                            "sh", "-c", "find /staging -mindepth 1 -delete"],
+                           cwd=ctx["workdir"], check=True)
+        return
+    shutil.rmtree(ctx["staging_dir"], ignore_errors=True)
+    os.makedirs(ctx["staging_dir"], exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +368,9 @@ def phase_p0(ctx):
         check(f"P0 {name} healthy", wait_health(base), base)
         code, body = http_raw(base, "/docs")
         check(f"P0 {name} Swagger UI", code == 200 and "swagger" in body.lower())
+
+    reset_staging(ctx)
+    info("staging dir reset")
 
     for name, base in ctx["bases"].items():
         code, st = http("GET", base, "/indexes/status")
@@ -541,6 +673,328 @@ def phase_p6(ctx):
           code == 200 and INDEX_NAME in plan, plan[:200])
 
 
+# ---------------------------------------------------------------------------
+# Reliable-write phases
+# ---------------------------------------------------------------------------
+
+def _rel_body(rid, message, **kw):
+    body = {"request_id": rid, "device_id": MARKER, "message": message,
+            "severity": "warn"}
+    body.update(kw)
+    return body
+
+
+def _db_rows_for(db, rid):
+    return db.q("SELECT id, device_id, occurred_at, severity, message "
+                "FROM device_fault_logs WHERE request_id = %s", (rid,))
+
+
+def phase_r0(ctx):
+    print("\n== R0: reliable write with db up; replay dedup; 409 ==")
+    db, b1, b2 = ctx["db"], ctx["bases"]["api1"], ctx["bases"]["api2"]
+    rid = "r0-" + MARKER
+    body = _rel_body(rid, "r0 hello")
+
+    code, r = http("POST", b1, "/logs/reliable", body)
+    check("R0 write -> 201 persisted", code == 201
+          and r.get("state") == "persisted" and r.get("id"),
+          f"code={code} body={r}")
+    check("R0 occurred_at fixed at acceptance", bool(r.get("occurred_at")))
+    row_id = r["id"]
+
+    code, r2 = http("GET", b2, f"/logs?device_id={MARKER}"
+                    "&start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z"
+                    "&limit=1000")
+    check("R0 visible via original GET /logs on the other instance",
+          code == 200 and any(it["id"] == row_id for it in r2["items"]))
+
+    code, st = http("GET", b2, f"/logs/reliable/{rid}")
+    check("R0 status persisted via api2",
+          code == 200 and st.get("state") == "persisted"
+          and st.get("id") == row_id, str(st.get("state")))
+
+    code, r3 = http("POST", b2, "/logs/reliable", body)  # 'lost receipt' retry
+    check("R0 replay deduplicated (same id)",
+          code == 201 and r3.get("deduplicated") and r3.get("id") == row_id,
+          f"code={code} body={r3}")
+    rows = _db_rows_for(db, rid)
+    check("R0 exactly one row in db", len(rows) == 1, str(len(rows)))
+
+    code, r4 = http("POST", b1, "/logs/reliable", _rel_body(rid, "r0 DIFFERENT"))
+    check("R0 same request_id different content -> 409",
+          code == 409 and r4.get("state") == "conflict", f"code={code}")
+    rows = _db_rows_for(db, rid)
+    check("R0 409 did not modify the row",
+          len(rows) == 1 and rows[0][4] == "r0 hello")
+
+    code, ov = http("GET", b1, "/logs/reliable")
+    check("R0 overview: db reachable, nothing pending",
+          code == 200 and ov.get("db_reachable") and ov["pending_count"] == 0,
+          str(ov.get("pending_request_ids")))
+
+    code, spec = http("GET", b1, "/openapi.json")
+    paths = spec.get("paths", {})
+    check("R0 Swagger documents the reliable endpoints",
+          code == 200 and "/logs/reliable" in paths
+          and "/logs/reliable/{request_id}" in paths, str(sorted(paths)))
+
+
+def phase_r1(ctx):
+    print("\n== R1: concurrent submissions collapse to one row ==")
+    db = ctx["db"]
+    bases = [ctx["bases"]["api1"], ctx["bases"]["api2"]]
+
+    rid = "r1-" + MARKER
+    body = _rel_body(rid, "r1 concurrent identical")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = [ex.submit(http, "POST", bases[i % 2], "/logs/reliable", body)
+                for i in range(12)]
+        results = [f.result() for f in futs]
+    codes = [c for c, _ in results]
+    check("R1 identical: all 201", all(c == 201 for c in codes), str(codes))
+    created = [r for c, r in results if not r.get("deduplicated")]
+    check("R1 identical: exactly one actual insert",
+          len(created) == 1, f"created={len(created)}")
+    ids = {r.get("id") for _, r in results}
+    check("R1 identical: all responses carry the same row id",
+          len(ids) == 1, str(ids))
+    check("R1 identical: exactly one row in db",
+          len(_db_rows_for(db, rid)) == 1)
+
+    rid2 = "r1x-" + MARKER
+    body_a = _rel_body(rid2, "r1x content A")
+    body_b = _rel_body(rid2, "r1x content B")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(http, "POST", bases[i % 2], "/logs/reliable",
+                          body_a if i % 2 == 0 else body_b)
+                for i in range(10)]
+        results = [f.result() for f in futs]
+    codes = [c for c, _ in results]
+    check("R1 conflicting: every request is 201 or 409",
+          all(c in (201, 409) for c in codes), str(codes))
+    n201, n409 = codes.count(201), codes.count(409)
+    check("R1 conflicting: at least one winner and one rejected",
+          n201 >= 1 and n409 >= 1, f"201={n201} 409={n409}")
+    rows = _db_rows_for(db, rid2)
+    check("R1 conflicting: exactly one row in db", len(rows) == 1)
+    # The surviving row must belong to the content that got the 201s.
+    winner_msg = rows[0][4]
+    a_won = winner_msg == "r1x content A"
+    exp_201 = sum(1 for i in range(10) if (i % 2 == 0) == a_won)
+    check("R1 conflicting: winner's submissions all 201, loser all 409",
+          n201 == exp_201 and n409 == 10 - exp_201,
+          f"winner={winner_msg!r} 201={n201} expected={exp_201}")
+
+
+def phase_r2(ctx):
+    print("\n== R2: db outage -> durable staging -> auto backfill ==")
+    db, b1, b2 = ctx["db"], ctx["bases"]["api1"], ctx["bases"]["api2"]
+    bases = [b1, b2]
+    rid = "r2-" + MARKER
+    body = _rel_body(rid, "r2 written during outage")
+
+    freeze_db(ctx)
+    t_frozen = time.time()
+    try:
+        code, r = http("POST", b1, "/logs/reliable", body, timeout=60)
+        check("R2 write during outage -> 202 staged (durable ack)",
+              code == 202 and r.get("state") == "staged" and r.get("id") is None,
+              f"code={code} body={r}")
+        accepted_occurred = datetime.fromisoformat(r["occurred_at"])
+
+        code, r2 = http("POST", b2, "/logs/reliable", body, timeout=60)
+        check("R2 re-submit during outage is idempotent",
+              code == 202 and r2.get("deduplicated"), f"code={code} body={r2}")
+
+        code, r3 = http("POST", b2, "/logs/reliable",
+                        _rel_body(rid, "r2 DIFFERENT"), timeout=60)
+        check("R2 different content during outage -> 409",
+              code == 409, f"code={code}")
+
+        code, st = http("GET", b1, f"/logs/reliable/{rid}", timeout=60)
+        check("R2 status while down: staged",
+              code == 200 and st.get("state") == "staged", str(st.get("state")))
+        code, ov = http("GET", b1, "/logs/reliable", timeout=60)
+        check("R2 overview while down lists it as pending",
+              code == 200 and rid in ov.get("pending_request_ids", []),
+              str(ov.get("pending_request_ids")))
+        check("R2 staged file present in shared dir",
+              rid + ".json" in staging_names(ctx), str(staging_names(ctx)))
+    finally:
+        unfreeze_db(ctx)
+        t_thawed = time.time()
+
+    st = wait_reliable_state(bases, rid, "persisted", timeout=90)
+    check("R2 backfilled after recovery", st.get("id") is not None,
+          f"id={st.get('id')}")
+    rows = _db_rows_for(db, rid)
+    check("R2 exactly one row after backfill", len(rows) == 1)
+    db_occurred = rows[0][2] if rows else None
+    check("R2 occurred_at kept from acceptance (not recovery time)",
+          db_occurred is not None and db_occurred == accepted_occurred
+          and accepted_occurred.timestamp() <= t_thawed,
+          f"db={db_occurred} accepted={accepted_occurred} thawed={t_thawed}")
+    check("R2 acceptance time lies inside the outage window",
+          t_frozen <= accepted_occurred.timestamp() <= t_thawed)
+
+    code, r4 = http("GET", b2, f"/logs?device_id={MARKER}"
+                    "&start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z"
+                    "&limit=1000")
+    check("R2 backfilled row readable via original GET /logs",
+          code == 200 and any(it["message"] == "r2 written during outage"
+                              for it in r4["items"]))
+    check("R2 staged file cleaned after backfill",
+          wait_staging_gone(ctx, rid + ".json"), str(staging_names(ctx)))
+    code, ov = http("GET", b1, "/logs/reliable")
+    check("R2 overview clean after backfill",
+          code == 200 and rid not in ov.get("pending_request_ids", [])
+          and rid not in ov.get("awaiting_cleanup_request_ids", []))
+
+
+def phase_r3(ctx):
+    print("\n== R3: staged records survive instance restart ==")
+    db = ctx["db"]
+    b1, b2 = ctx["bases"]["api1"], ctx["bases"]["api2"]
+    rid = "r3-" + MARKER
+
+    freeze_db(ctx)
+    try:
+        code, r = http("POST", b1, "/logs/reliable",
+                       _rel_body(rid, "r3 staged before restart"), timeout=60)
+        check("R3 staged during outage", code == 202, f"code={code}")
+        # Hard-restart BOTH instances while the database is still down.
+        for name in ("api1", "api2"):
+            ctx["instances"][name].kill()
+            ctx["instances"][name].start()
+    finally:
+        unfreeze_db(ctx)
+
+    check("R3 api1 healthy after restart", wait_health(b1))
+    check("R3 api2 healthy after restart", wait_health(b2))
+    st = wait_reliable_state([b1, b2], rid, "persisted", timeout=90)
+    check("R3 staged record backfilled after restart+recovery",
+          st.get("id") is not None)
+    check("R3 exactly one row", len(_db_rows_for(db, rid)) == 1)
+
+
+def phase_r4(ctx):
+    print("\n== R4: db row + leftover staged copy -> no dup, not pending ==")
+    db, b1, b2 = ctx["db"], ctx["bases"]["api1"], ctx["bases"]["api2"]
+    rid = "r4-" + MARKER
+    rec = app_reliable.new_record(rid, MARKER, "r4 leftover staged copy",
+                                  "warn", None)
+    # Simulate: the insert succeeded but the instance died before removing
+    # the staged copy -> row in db AND file in the shared dir.
+    db.q("INSERT INTO device_fault_logs "
+         "(request_id, device_id, occurred_at, severity, message) "
+         "VALUES (%s, %s, %s, %s, %s)",
+         (rid, MARKER, rec["occurred_at"], "warn", "r4 leftover staged copy"))
+    db_id = _db_rows_for(db, rid)[0][0]
+    write_staged_file(ctx, rec)
+    info("planted leftover staged copy (backfill may clean it at any time)")
+
+    # Deterministic invariants while the row is in the db, no matter when the
+    # backfill cleans the leftover file:
+    code, st = http("GET", b2, f"/logs/reliable/{rid}")
+    check("R4 status says persisted (never pending)",
+          code == 200 and st.get("state") == "persisted"
+          and st.get("id") == db_id, str(st))
+    info(f"staged_copy_remaining observed: {st.get('staged_copy_remaining')}")
+
+    ever_pending, saw_awaiting = False, False
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        code, ov = http("GET", b1, "/logs/reliable")
+        ever_pending |= rid in ov.get("pending_request_ids", [])
+        saw_awaiting |= rid in ov.get("awaiting_cleanup_request_ids", [])
+        if rid + ".json" not in staging_names(ctx):
+            break  # cleaned before the next poll
+        time.sleep(0.2)
+    check("R4 leftover never reported as pending", not ever_pending)
+    info(f"awaiting_cleanup listing observed: {saw_awaiting}")
+
+    check("R4 backfill removed the leftover copy",
+          wait_staging_gone(ctx, rid + ".json"), str(staging_names(ctx)))
+    rows = _db_rows_for(db, rid)
+    check("R4 still exactly one row (no duplicate write)",
+          len(rows) == 1, str(len(rows)))
+
+
+def phase_r5(ctx):
+    print("\n== R5: staged copy contradicting db -> quarantined, not applied ==")
+    db, b1 = ctx["db"], ctx["bases"]["api1"]
+    rid = "r5-" + MARKER
+    db.q("INSERT INTO device_fault_logs "
+         "(request_id, device_id, occurred_at, severity, message) "
+         "VALUES (%s, %s, now(), 'error', 'r5 db truth')", (rid, MARKER))
+    rec = app_reliable.new_record(rid, MARKER, "r5 DIFFERENT staged content",
+                                  "error", None)
+    write_staged_file(ctx, rec)
+
+    check("R5 conflicting staged copy quarantined",
+          wait_staging_present(ctx, rid + ".json.conflict."),
+          str(staging_names(ctx)))
+    rows = _db_rows_for(db, rid)
+    check("R5 db row untouched by the conflicting copy",
+          len(rows) == 1 and rows[0][4] == "r5 db truth", str(rows))
+    code, st = http("GET", b1, f"/logs/reliable/{rid}")
+    check("R5 status: persisted + conflicted copy flagged",
+          code == 200 and st.get("state") == "persisted"
+          and st.get("conflicted_staged_copy") is True, str(st))
+    code, ov = http("GET", b1, "/logs/reliable")
+    check("R5 overview lists the conflict",
+          code == 200 and rid in ov.get("conflicted_request_ids", []), str(ov))
+
+
+def phase_r6(ctx):
+    print("\n== R6: db down AND staging unwritable -> 503 ==")
+    if ctx["mode"] != "local":
+        check("R6 both stores unavailable -> 503 (local mode only)",
+              True, "skipped in docker mode")
+        return
+    b1 = ctx["bases"]["api1"]
+    rid = "r6-" + MARKER
+    sdir = ctx["staging_dir"]
+    os.chmod(sdir, 0o555)
+    freeze_db(ctx)
+    try:
+        code, r = http("POST", b1, "/logs/reliable",
+                       _rel_body(rid, "r6 nowhere to persist"), timeout=60)
+        check("R6 db+staging both fail -> 503 rejected",
+              code == 503 and r.get("state") == "rejected",
+              f"code={code} body={r}")
+        check("R6 nothing staged for the rejected record",
+              rid + ".json" not in staging_names(ctx))
+    finally:
+        unfreeze_db(ctx)
+        os.chmod(sdir, 0o755)
+    code, r = http("POST", b1, "/logs/reliable",
+                   _rel_body(rid, "r6 retry after recovery"), timeout=60)
+    check("R6 retry after recovery succeeds",
+          code == 201 and r.get("state") == "persisted", f"code={code}")
+
+
+def phase_r7(ctx):
+    print("\n== R7: client-supplied occurred_at survives staging round trip ==")
+    db, b1, b2 = ctx["db"], ctx["bases"]["api1"], ctx["bases"]["api2"]
+    rid = "r7-" + MARKER
+    explicit = "2026-01-02T03:04:05.123456+00:00"
+    freeze_db(ctx)
+    try:
+        code, r = http("POST", b1, "/logs/reliable",
+                       _rel_body(rid, "r7 explicit ts", occurred_at=explicit),
+                       timeout=60)
+        check("R7 staged during outage", code == 202, f"code={code}")
+    finally:
+        unfreeze_db(ctx)
+    wait_reliable_state([b1, b2], rid, "persisted", timeout=90)
+    rows = _db_rows_for(db, rid)
+    check("R7 explicit occurred_at preserved exactly",
+          len(rows) == 1
+          and rows[0][2] == datetime.fromisoformat(explicit),
+          f"db={rows[0][2] if rows else None} expected={explicit}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["local", "docker"], required=True)
@@ -549,14 +1003,24 @@ def main():
     ap.add_argument("--api2", default="http://127.0.0.1:8002")
     ap.add_argument("--workdir", default="/workspace")
     ap.add_argument("--logdir", default="/tmp/ops-logs")
+    ap.add_argument("--staging-dir", default="/tmp/ops-staging")
     args = ap.parse_args()
 
     os.makedirs(args.logdir, exist_ok=True)
+    # Reuse the app's staging-file format helpers for the leftover/conflict
+    # simulations (R4/R5).
+    sys.path.insert(0, args.workdir)
+    global app_reliable
+    import app.reliable as _app_reliable
+    app_reliable = _app_reliable
+
     db = Db(args.dsn)
     if args.mode == "local":
         instances = {
-            "api1": LocalInstance("api1", 8001, args.dsn, args.workdir, args.logdir),
-            "api2": LocalInstance("api2", 8002, args.dsn, args.workdir, args.logdir),
+            "api1": LocalInstance("api1", 8001, args.dsn, args.workdir,
+                                  args.logdir, args.staging_dir),
+            "api2": LocalInstance("api2", 8002, args.dsn, args.workdir,
+                                  args.logdir, args.staging_dir),
         }
     else:
         instances = {"api1": DockerInstance("api1", args.workdir),
@@ -567,6 +1031,8 @@ def main():
         "instances": instances,
         "bases": {"api1": args.api1, "api2": args.api2},
         "workdir": args.workdir,
+        "logdir": args.logdir,
+        "staging_dir": args.staging_dir,
     }
 
     try:
@@ -577,10 +1043,20 @@ def main():
         phase_p4(ctx)
         phase_p5(ctx)
         phase_p6(ctx)
+        phase_r0(ctx)
+        phase_r1(ctx)
+        phase_r2(ctx)
+        phase_r3(ctx)
+        phase_r4(ctx)
+        phase_r5(ctx)
+        phase_r6(ctx)
+        phase_r7(ctx)
     finally:
         passed = sum(1 for _, ok in RESULTS if ok)
         print(f"\n==== summary: {passed}/{len(RESULTS)} checks passed ====")
         if args.mode == "local":
+            subprocess.run(["pkill", "-CONT", "-x", "postgres"],
+                           capture_output=True)  # never leave the db frozen
             for inst in ctx["instances"].values():
                 inst.kill()
     if not all(ok for _, ok in RESULTS):

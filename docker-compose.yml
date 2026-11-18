@@ -7,6 +7,9 @@ services:
       POSTGRES_USER: ops
       POSTGRES_PASSWORD: ops
       POSTGRES_DB: faultlogs
+    # Default container /dev/shm is 64MB; parallel workers during the 4M-row
+    # preload and later queries need more dynamic shared memory.
+    shm_size: 256m
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
@@ -29,6 +32,12 @@ services:
     environment:
       DATABASE_URL: postgresql://ops:ops@db:5432/faultlogs
       ORPHAN_GRACE_SECONDS: "15"
+      # Shared persistent staging directory: both instances stage outage-time
+      # records here and both run the backfill loop against it.
+      STAGING_DIR: /staging
+      BACKFILL_INTERVAL_SECONDS: "2"
+    volumes:
+      - staging:/staging
     depends_on:
       db:
         condition: service_healthy
@@ -52,3 +61,4 @@ services:
 
 volumes:
   pgdata:
+  staging:
